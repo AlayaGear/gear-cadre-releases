@@ -1054,15 +1054,19 @@ jobs:
       # failing in a step it has no credentials for. `vars.CADRE_DOWNLOAD_SITE_BASE` is the public
       # origin (EdgeOne's preset `*.edgeone.cool` domain answers 401 to the world, so this only
       # becomes useful once a real domain is attached in the console).
-      - name: Mirror the release to EdgeOne Pages
-        if: ${{ env.SITE_BASE != '' && env.HAVE_EDGEONE_TOKEN == 'true' }}
+      # **Built once, published twice**, and built outside either publisher's `if:` on purpose.
+      #
+      # This used to live inside the EdgeOne step, which meant the page existed only when an EdgeOne
+      # token did. GitHub Pages is now a second destination and must not inherit that gate - nor the
+      # EdgeOne step's failures, of which run #1 had one.
+      #
+      # The page is the same bytes either way. `build-download-site.mjs` decides *per artifact*
+      # whether it fits the 25 MB mirror ceiling: what fits is copied into the site and linked
+      # relatively (`./Gear.Cadre_x64-setup.exe`), so it is served by whichever host is serving the
+      # page; what does not - today the 91 MB AppImage - keeps its GitHub Releases URL and the page
+      # says so. That behaviour is what makes one build correct for both hosts.
+      - name: Build the download page
         shell: bash
-        env:
-          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
-          # The project must already exist and be of the **direct upload** type. `deploy -n` CREATES
-          # a project when the name is free, so a typo here does not fail - it silently publishes a
-          # perfectly good release to a new empty project nobody is looking at.
-          SITE_PROJECT: ${{ vars.CADRE_DOWNLOAD_SITE_PROJECT || 'gear-cadre' }}
         run: |
           set -euo pipefail
           version="${{ needs.version.outputs.version }}"
@@ -1076,6 +1080,25 @@ jobs:
             --github-base "https://github.com/${RELEASES_REPO}/releases/download/v${version}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # Pages takes the directory as an artifact here and deploys it from a separate job below,
+      # which is the shape `deploy-pages` requires: the deployment needs `pages: write` and
+      # `id-token: write`, and granting those to *this* job would hand them to every step that
+      # handles the signing key.
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+
+      - name: Mirror the release to EdgeOne Pages
+        if: ${{ env.SITE_BASE != '' && env.HAVE_EDGEONE_TOKEN == 'true' }}
+        shell: bash
+        env:
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
+          # The project must already exist and be of the **direct upload** type. `deploy -n` CREATES
+          # a project when the name is free, so a typo here does not fail - it silently publishes a
+          # perfectly good release to a new empty project nobody is looking at.
+          SITE_PROJECT: ${{ vars.CADRE_DOWNLOAD_SITE_PROJECT || 'gear-cadre' }}
+        run: |
+          set -euo pipefail
           # Pinned: an unpinned `npx edgeone` is a floating dependency in the publish path of a
           # release. Same reasoning as the SHA pins on every action above.
           npx --yes edgeone@1.6.21 makers deploy "$RUNNER_TEMP"/site \
@@ -1106,3 +1129,31 @@ jobs:
           done
           echo "::error::${SITE_BASE} does not serve $want" >&2
           exit 1
+
+  # The download page, on this repository's own Pages site.
+  #
+  # A second home for the same page rather than a replacement for the EdgeOne mirror: Pages is free,
+  # needs no token, and cannot fail the way run #1's mirror did, but it is a static host rather than
+  # a CDN and the artifacts it serves are the ones small enough to be copied into the site. The
+  # AppImage still comes from GitHub Releases on both.
+  #
+  # Its own job because `deploy-pages` needs `pages: write` and `id-token: write`. Granting those to
+  # the publish job would hand them to the steps that handle the signing key, for no reason.
+  #
+  # `if: needs.publish.result == 'success'` rather than `always()`: a page advertising a release that
+  # did not finish publishing is worse than no update to the page.
+  pages:
+    name: publish the download page
+    needs: publish
+    if: ${{ needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
