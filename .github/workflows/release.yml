@@ -647,7 +647,25 @@ jobs:
       # `key` is the leg, so the three do not overwrite each other, and `save-if` keeps writes to
       # `main` - a dispatch against a branch reads the cache but does not replace it with one built
       # from unmerged code.
+      #
+      # # Hosted only, and the self-hosted default is exactly why
+      #
+      # A GitHub cache round trip is worth it on an ephemeral runner, which starts with nothing, and
+      # is worth *less than nothing* on a persistent one, which starts with the last build still on
+      # disk. The version of this file that ran on self-hosted runners said so and removed the action
+      # for that reason; it was re-added here when every leg was hosted, and then the default fleet
+      # changed to self-hosted and this line was not revisited.
+      #
+      # It hung a release: run #6's Windows leg built green all the way through `upload-artifact` and
+      # then sat in `Post Run Swatinem/rust-cache` compressing **2.2 GB** of target directories
+      # (881 MB for `crates`, 1.3 GB for `src-tauri`) out of a workstation to GitHub. On that fleet
+      # the machine already has those directories; shipping them to a cache service and back is pure
+      # cost.
+      #
+      # So the action runs only for `hosted`. Self-hosted keeps its own `CARGO_HOME` and `target/`
+      # between jobs, which is the same saving without the transfer.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: ${{ inputs.runners == 'hosted' }}
         with:
           key: ${{ matrix.leg }}
           save-if: ${{ inputs.source-ref == 'main' }}
