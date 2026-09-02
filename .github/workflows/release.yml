@@ -104,6 +104,12 @@ on:
         description: 'Ref of AlayaCapybara/gear-cadre to build (branch, tag or SHA)'
         required: false
         default: main
+      runners:
+        description: 'Which fleet builds this (hosted is the only safe default here)'
+        required: false
+        default: hosted
+        type: choice
+        options: [hosted, self-hosted]
 
 concurrency:
   group: release-${{ github.ref }}
@@ -368,7 +374,11 @@ jobs:
   build:
     needs: version
     name: ${{ matrix.leg }}
-    runs-on: ${{ matrix.runner }}
+    # **`self-hosted` is a benchmark setting, not a mode to leave on.** This repository is public, so
+    # a self-hosted runner here executes whatever a fork's pull request puts in a workflow, on a
+    # machine somebody owns - the hazard the Windows leg's comment describes at length. It exists to
+    # measure the two fleets against each other and should return to `hosted` immediately after.
+    runs-on: ${{ inputs.runners == 'self-hosted' && matrix.self-runner || matrix.runner }}
     # Empty for every leg but Linux, which is how a matrix opts one job into a container: an unset
     # `container` is no container at all, so Windows and macOS are untouched by this line.
     container: ${{ matrix.container }}
@@ -393,6 +403,7 @@ jobs:
           # the constraint inverted when the workflow moved, which is why every leg below is hosted.
           - leg: windows-x86_64
             runner: windows-latest
+            self-runner: [self-hosted, Windows, X64, build]
             rust-target: x86_64-pc-windows-msvc
           # ---------------------------------------------------------------- macOS: aarch64 only
           #
@@ -416,6 +427,7 @@ jobs:
           # for you.
           - leg: darwin-aarch64
             runner: macos-latest
+            self-runner: [self-hosted, macOS, ARM64, build]
             rust-target: aarch64-apple-darwin
           # ---------------------------------------------------------------- darwin-x86_64: still off
           #
@@ -471,6 +483,12 @@ jobs:
           # divergence between this workflow and `installer.yml` would cost.
           - leg: linux-x86_64
             runner: ubuntu-latest
+            # `build`, not the retired `desktop`: that label belonged to `liu-linux-01`, a
+            # repo-level runner deleted when the fleet moved to org scope. The org's Linux runners
+            # carry `build`, and they can serve this leg for the same reason the host never mattered
+            # much - it builds inside `ubuntu:22.04` and provisions its own toolchain, so all the
+            # host owes it is Docker.
+            self-runner: [self-hosted, Linux, X64, build]
             rust-target: x86_64-unknown-linux-gnu
             container: ubuntu:22.04
     env:
