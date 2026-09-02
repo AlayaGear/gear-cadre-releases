@@ -131,11 +131,138 @@ env:
   RELEASE_TAG: latest
 
 jobs:
+  # The hygiene rules over this file, checked before anything is built.
+  #
+  # These lived in `packages/client/src/test-support/release-artifacts.test.ts` in the source
+  # repository, which read `.github/workflows/release.yml` off disk. That file is here now, so that
+  # test can no longer see it — and rather than delete the guard along with the move, it runs here,
+  # over the file it is actually about. Five of that suite's nine cases assert things about
+  # `update-manifest.mjs` and `build-download-site.mjs`; those stayed behind, because the scripts did.
+  #
+  # A job rather than a step, so it gates the whole release: ~20 seconds against ~20 minutes of three
+  # build legs, and every failure it catches costs a *user* an install rather than costing a
+  # maintainer a red run they would notice anyway.
+  guard:
+    name: guard this workflow's own invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # This repository, not the source: the subject of every check below is this file.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          sparse-checkout: .github/workflows/release.yml
+          sparse-checkout-cone-mode: false
+
+      # **The guard excludes itself, and that is not tidiness.** Every pattern below appears in this
+      # job as the literal text of a grep, so a check run over the whole file matches its own source
+      # and reports a violation that does not exist. Measured, not anticipated: the first version of
+      # this job failed with "a prune targets something other than the alias" against a workflow whose
+      # prune was perfectly correct, because `gh release delete-asset [^ ]+` is itself a line in it.
+      #
+      # Stripping the block from `  guard:` up to the next job keeps the subject the *rest* of the
+      # workflow, which is what these rules are about.
+      - name: Take a copy of the workflow without this job in it
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed '/^  guard:/,/^  version:/{/^  version:/!d}' .github/workflows/release.yml > "$RUNNER_TEMP/subject.yml"
+          echo "checking $(wc -l < "$RUNNER_TEMP/subject.yml") lines, this job excluded"
+
+      - name: The upload globs still name every installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          wf="$RUNNER_TEMP/subject.yml"
+          fail() { echo "::error::$1" >&2; exit 1; }
+
+          # **macOS ships two bundles and they are not interchangeable.** The `.dmg` is the only
+          # thing a human can install from; the `.app.tar.gz` is the only thing the updater can
+          # swap in place. This workflow uploaded just the tarball for its first six releases,
+          # which left macOS with an upgrade path and no first install — a state that looks
+          # perfectly healthy from the publish log, because `latest.json` was complete and correct
+          # the whole time.
+          grep -qF 'bundle/dmg/*.dmg' "$wf" \
+            || fail "no .dmg is uploaded; macOS would have an updater and no first install"
+          grep -qF 'bundle/macos/*.app.tar.gz' "$wf" \
+            || fail "no .app.tar.gz is uploaded; macOS could install but never update"
+          grep -qF 'bundle/nsis/*-setup.exe' "$wf" \
+            || fail "no Windows installer is uploaded"
+
+          # Anchored to end-of-line, because `*.AppImage` is a prefix of `*.AppImage.sig`: an
+          # unanchored pair of checks would both pass on the `.sig` glob alone, and the bundle a
+          # human downloads would be the one missing.
+          grep -qE 'bundle/appimage/\*\.AppImage$' "$wf" \
+            || fail "the .AppImage itself is not uploaded, only its signature"
+          grep -qE 'bundle/appimage/\*\.AppImage\.sig$' "$wf" \
+            || fail "the .AppImage signature is not uploaded, so Linux cannot self-update"
+
+      - name: Both releases are written and only the alias is pruned
+        shell: bash
+        run: |
+          set -euo pipefail
+          wf="$RUNNER_TEMP/subject.yml"
+          fail() { echo "::error::$1" >&2; exit 1; }
+
+          # `v$version` is the archive, kept forever; `$RELEASE_TAG` is the rolling alias whose URL
+          # is compiled into clients that have already shipped.
+          grep -qF 'publish_to "v$version"' "$wf" || fail "the per-version release is no longer published"
+          grep -qF 'publish_to "$RELEASE_TAG"' "$wf" || fail "the rolling alias is no longer published"
+
+          # **The archive must never be pruned** — keeping its assets is the entire point of having
+          # it. Checked as "no delete-asset names anything but the alias" rather than by counting,
+          # so a second prune loop added later cannot slip past.
+          deletions=$(grep -oE 'gh release delete-asset [^ ]+' "$wf" || true)
+          [ -n "$deletions" ] || fail "nothing prunes the alias any more; its assets would accumulate"
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in
+              *'delete-asset "$RELEASE_TAG"'*) ;;
+              *) fail "a prune targets something other than the alias ($line); the archive must be kept" ;;
+            esac
+          done <<EOF
+          $deletions
+          EOF
+
+          # Each manifest describes its own release. If the archive carried the alias's base URL,
+          # every archived manifest would silently start describing whatever shipped last.
+          grep -qF -- '--base-url "$base/v$VERSION"' "$wf" || fail "the archive manifest lost its own base URL"
+          grep -qF -- '--base-url "$base/${RELEASE_TAG}"' "$wf" || fail "the alias manifest lost its own base URL"
+
+      - name: Every manifest is published as latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          wf="$RUNNER_TEMP/subject.yml"
+          fail() { echo "::error::$1" >&2; exit 1; }
+
+          # **`gh release upload` names the asset after the file's basename.** v0.1.14 shipped an
+          # archive whose manifest was called `latest.versioned.json`, so
+          # `/download/v0.1.14/latest.json` 404'd — a release that looked completely healthy and
+          # whose feed could not be fetched at the one path anything would look for it at.
+          #
+          # Checked as "every path handed to publish_to ends in /latest.json", which is the property
+          # that matters, rather than by naming the directory the fix happened to use.
+          handed=$(grep -oE 'publish_to "[^"]+" "[^"]+" [^ ]+' "$wf" | awk '{print $NF}')
+          count=$(printf '%s' "$handed" | grep -c . || true)
+          [ "$count" -eq 2 ] || fail "expected two manifests handed to publish_to, found $count: $handed"
+          while IFS= read -r manifest; do
+            [ -n "$manifest" ] || continue
+            case "$manifest" in
+              */latest.json) ;;
+              *) fail "a manifest is published as $manifest rather than .../latest.json; its feed URL would 404" ;;
+            esac
+          done <<EOF
+          $handed
+          EOF
+
+          echo "every release-artifact invariant holds" >> "$GITHUB_STEP_SUMMARY"
+
   # Decided once, used by all three build legs and by the manifest. Three legs each deriving it
   # would be three chances to disagree, and a manifest whose version differs from the installers it
   # names is one every client rejects.
   version:
     name: decide the version
+    needs: guard
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
