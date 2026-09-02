@@ -1,0 +1,923 @@
+name: Release
+
+# Cut a release and publish the update feed the desktop app reads.
+#
+# # This workflow lives in the **public releases repository**, and the source does not
+#
+# It was in the private `AlayaCapybara/gear-cadre` until 2026-09-02, built by self-hosted runners on
+# developer workstations. It moved here for one reason: **standard GitHub-hosted runners are free,
+# with no minute cap, on a public repository** - including macOS, which carries a 10x multiplier on
+# a private one and was the whole reason a Mac mini was wired into CI at all. The self-hosted fleet
+# was also the least reliable part of the pipeline; the Linux runner lost communication with the
+# server twice in a row on the day of the move.
+#
+# The cost of that is stated plainly rather than buried, because it is permanent and it is not
+# small:
+#
+#   * **The source is private and this repository is public, so every build log here is public.**
+#     A compiler error quotes source lines; `tsc` prints code; a panic prints paths and a stack
+#     trace. That is a continuous leak of a private codebase, not a one-time exposure. Anything
+#     that must not be world-readable must not be printed by a build step.
+#   * **A read credential for the private repository lives in this repository's secrets**
+#     (`SOURCE_READ_TOKEN`). A read-only *deploy key* would be the tighter instrument - scoped to
+#     one repository by construction, unable to write, and impossible to widen - and it is what
+#     this was written for. It is not used because **the `AlayaGear` organisation disables deploy
+#     keys**, which the API reports as `Deploy keys are disabled for this repository` (HTTP 422).
+#     If that policy is ever relaxed (org Settings -> Repository policies), switch the three
+#     checkouts below from `token:` to `ssh-key:` and delete the token; nothing else changes.
+#
+#     Until then the token must be a **fine-grained PAT scoped to `AlayaCapybara/gear-cadre` alone
+#     with `Contents: Read`** and nothing else. A classic or org-wide token would put write access
+#     to every repository the grantor can reach into a public repository's secret store.
+#   * **The signing key lives here too.** See below for why that is the sharpest edge.
+#
+# What the move *removed* is worth noting as well: `RELEASES_REPO_TOKEN` is gone. This workflow now
+# runs inside the repository it publishes to, so the default `GITHUB_TOKEN` with `contents: write`
+# is sufficient, and one long-lived cross-repository credential stopped existing.
+#
+# # Why this is separate from `installer.yml`
+#
+# That workflow answers "does packaging still work" and uploads an artifact to the Actions tab. This
+# one produces the thing users actually receive: signed installers plus the `latest.json` manifest
+# `tauri-plugin-updater` polls. They share most of their build steps and almost none of their
+# purpose, and merging them would mean either signing every packaging check or publishing every
+# green build.
+#
+# # What has to exist before this can run
+#
+# Four secrets, none of which this repository can generate for itself:
+#
+#   SOURCE_READ_TOKEN                   fine-grained PAT, Contents:Read on AlayaCapybara/gear-cadre
+#   TAURI_SIGNING_PRIVATE_KEY           the minisign secret key, from `tauri signer generate`
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password - unset, because the key has none
+#   CADRE_UPDATE_PUBKEY                 the matching public key, baked into the client
+#
+# and one optional, for the download mirror:
+#
+#   EDGEONE_API_TOKEN                   absent is fine; the mirror steps skip themselves
+#
+# The keypair exists (minisign key `36106FA1025CF866`, generated 2026-08-30) and the two key secrets
+# are set. It has **no passphrase**, so `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is deliberately absent
+# and the bundler is handed an empty one; that is normal for a CI key, whose password would have to
+# live beside it in the same secret store anyway.
+#
+# **The private half is unrecoverable.** Lose it and every existing install is permanently orphaned,
+# because no future release can be verified against the key they already trust. It must exist
+# somewhere that is neither this repository nor CI.
+#
+# It is now stored in a **public** repository's secret store, which changes the threat model even
+# though GitHub never exposes a secret to a fork's pull request and only a collaborator with write
+# access can dispatch this workflow. What it means in practice: the set of people with write access
+# here is the set of people who can cause this key to sign something, so that set should stay as
+# small as the set that could before the move.
+#
+# The public key is not a secret, but it lives in the secret store anyway rather than in
+# `tauri.conf.json`, so that a fork building this tree gets an inert updater rather than one pointed
+# at our feed. `paths.rs` has a test asserting the committed config stays empty.
+
+on:
+  # **Dispatch only, and there is no `push:` trigger any more.** The source lives in another
+  # repository, so a commit or a tag here is a change to this workflow rather than to the product -
+  # nothing pushed to *this* repository is ever a thing to release. The ref to build is an input.
+  #
+  # A tag release is still reachable and is still a tag on the **source** repository: dispatch with
+  # `source-ref: v0.2.0`. The version job recognises a `v`-prefixed ref and publishes
+  # `tauri.conf.json`'s exact version, exactly as `push: tags` used to.
+  #
+  # **There is deliberately no automatic cadence here.** This ran nightly from `main` until
+  # 2026-09-01, on the reasoning that per-commit was unaffordable - one run is ~19 min of Windows
+  # plus two macOS legs, and `main` takes ~19 commits a day. That argument was only ever about
+  # *which* automatic trigger to use; the decision now is that no build should ship to users
+  # without someone choosing to ship it. A publish moves the feed every already-installed client
+  # polls, so an unattended one hands whatever landed on `main` that day to every install with no
+  # human in the loop.
+  #
+  # If an automatic cadence is ever wanted again, re-add a `schedule:` block here rather than
+  # `push: branches: [main]` - the cost figures above are why - and pick a minute other than 00,
+  # where GitHub's scheduled-run queue is long enough to delay a run by many minutes.
+  #
+  # No `version` input: the version is derived below from what is actually built, so an input would
+  # only be a second place for it to disagree from.
+  workflow_dispatch:
+    inputs:
+      source-ref:
+        description: 'Ref of AlayaCapybara/gear-cadre to build (branch, tag or SHA)'
+        required: false
+        default: main
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# `contents: write` on the publish job alone, and read everywhere else. This is what replaced
+# `RELEASES_REPO_TOKEN`: the workflow now runs in the repository it publishes to, so the job that
+# creates the release needs no credential of its own beyond the token GitHub already hands it.
+permissions:
+  contents: read
+
+env:
+  # Where the manifest and installers are served from - **this repository**, since the move. Kept as
+  # a variable rather than inlined so the publish steps read the same as they did when it named
+  # another repository, and so a future move to an object store touches one line. `gh` defaults to
+  # the current repository anyway; naming it keeps every command explicit about what it writes.
+  RELEASES_REPO: ${{ github.repository }}
+  # The private repository this builds. Not a secret - the name is in the README - but the *access*
+  # is: see SOURCE_READ_TOKEN above.
+  SOURCE_REPO: AlayaCapybara/gear-cadre
+  # The **alias** tag, not the only one. Every publish writes two releases: `v<version>`, which is
+  # kept forever, and this rolling one, which mirrors the newest. The alias exists because the feed
+  # URL is compiled into clients that have already shipped and therefore has to stay constant while
+  # versions move - which a per-version tag alone cannot do. See the publish step.
+  RELEASE_TAG: latest
+
+jobs:
+  # Decided once, used by all three build legs and by the manifest. Three legs each deriving it
+  # would be three chances to disagree, and a manifest whose version differs from the installers it
+  # names is one every client rejects.
+  version:
+    name: decide the version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      # The **source**, not this repository. `tauri.conf.json` is the only thing this job reads, and
+      # it lives over there; checking this repository out would find a README.
+      #
+      # `sparse-checkout` because that one file is all it needs and the source tree is large. It is
+      # not a security boundary - the deploy key can read everything either way - just the cheapest
+      # correct fetch.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source-ref }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          sparse-checkout: packages/client/src-tauri/tauri.conf.json
+          sparse-checkout-cone-mode: false
+      - id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          conf=$(node -p "require('./packages/client/src-tauri/tauri.conf.json').version")
+          case "$conf" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::tauri.conf.json version '$conf' is not MAJOR.MINOR.PATCH" >&2; exit 1 ;;
+          esac
+
+          # **A tag release is now a `v`-prefixed `source-ref`, not this repository's own ref.**
+          # Before the move this asked `GITHUB_REF_TYPE`, which described the repository holding the
+          # workflow; that repository is no longer the one holding the product, so its ref says
+          # nothing about what is being released. The input does.
+          source_ref='${{ inputs.source-ref }}'
+          case "$source_ref" in
+            v[0-9]*)
+              # A real release publishes exactly what the source says it is.
+              version="$conf"
+              if [ "${source_ref#v}" != "$version" ]; then
+                echo "::error::source-ref ${source_ref} disagrees with tauri.conf.json ($version). Bump it (and the two files paths.rs pins to it) before tagging." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              # A dispatch. **The patch number has to move or the whole thing is inert**: the
+              # updater only offers a strictly greater semver, so a build stamped with the same
+              # version as the last one is invisible to every client already on it. `run_number` is
+              # monotonic per workflow and bare-integer, which matters because the Windows MSI
+              # bundler rejects a pre-release suffix - `0.2.0-nightly.7` cannot be built at all
+              # (see paths.rs).
+              #
+              # **This counter restarted at 1 when the workflow moved here**, which is exactly the
+              # hazard the ordering check below describes: `run_number` is scoped to a workflow file
+              # path, and this is a new path in a new repository. The live feed was at `0.1.20`, so
+              # run #1 here would have computed `0.1.1` and been rejected. The source was moved to
+              # `0.2.0` at the same time for that reason, giving the patch space a fresh start above
+              # the old line - `0.2.1`, `0.2.2`, and up.
+              version="${conf%.*}.${GITHUB_RUN_NUMBER}"
+              ;;
+          esac
+
+          # Dispatches and tagged releases share one channel (`latest`), so they share one number
+          # line - and dispatches climb it. After 42 of them the feed advertises 0.1.42, and a
+          # release tagged v0.1.0 would publish something *older* than what clients already have:
+          # the updater only moves forward, so every install would silently ignore it and the
+          # release would look published and reach nobody.
+          #
+          # Checked against the live manifest for **every** publish, not just tags. A dispatch is
+          # monotonic by construction only while `run_number` is - and that counter is scoped to
+          # the workflow's file path, so renaming or recreating `release.yml` restarts it at 1. It
+          # would then emit `0.1.1` against a live `0.1.42` and **every client would silently stop
+          # updating**: the updater offers nothing older, so there is no error anywhere, just a
+          # feed that quietly stops working. This turns that into a failed run.
+          feed="https://github.com/${RELEASES_REPO}/releases/download/${RELEASE_TAG}/latest.json"
+          # A fetch that fails - no release yet, or GitHub down - must not block a release, so an
+          # unreadable manifest skips the check rather than failing it.
+          live=$(curl -fsSL --max-time 30 "$feed" 2>/dev/null | node -e "
+            let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
+              try { process.stdout.write(String(JSON.parse(s).version || '')); } catch { process.stdout.write(''); }
+            });" || true)
+          if [ -z "$live" ]; then
+            echo "no readable manifest at $feed yet; skipping the ordering check" >> "$GITHUB_STEP_SUMMARY"
+          else
+            greater=$(node -e "
+              const [a,b]=process.argv.slice(1).map(v=>v.split('.').map(Number));
+              for (let i=0;i<3;i++) { if (a[i]!==b[i]) { console.log(a[i]>b[i]?'yes':'no'); process.exit(0); } }
+              console.log('no');" "$version" "$live")
+            if [ "$greater" != "yes" ]; then
+              case "$source_ref" in
+                v[0-9]*)
+                  echo "::error::source-ref $source_ref publishes $version but the feed already advertises $live, which is newer or equal. Every client would ignore the release. Bump tauri.conf.json past $live - dispatched builds share this channel and have moved it on." >&2
+                  ;;
+                *)
+                  echo "::error::this run would publish $version but the feed already advertises $live. run_number has gone backwards, which happens when this workflow is renamed, recreated, or moved to another repository - the counter is scoped to the workflow file path, and moving repositories restarts it at 1. Publishing would silently stop every client updating. Raise the minor in the source's tauri.conf.json so the patch space starts fresh above $live." >&2
+                  ;;
+              esac
+              exit 1
+            fi
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publishing as $version" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: version
+    name: ${{ matrix.leg }}
+    runs-on: ${{ matrix.runner }}
+    # Empty for every leg but Linux, which is how a matrix opts one job into a container: an unset
+    # `container` is no container at all, so Windows and macOS are untouched by this line.
+    container: ${{ matrix.container }}
+    timeout-minutes: 90
+    strategy:
+      # One failing platform must not delete the artifacts of the others: a Windows-only release is
+      # publishable, and `update-manifest.mjs` reports which platforms it left out.
+      fail-fast: false
+      matrix:
+        include:
+          # Hosted, and free: standard runners cost nothing on a public repository, which is the
+          # whole reason this workflow moved here.
+          #
+          # It was `yihao-win-01`, a developer workstation whose runner `.env` had to pin CARGO_HOME,
+          # RUSTUP_HOME, the tool cache, the pnpm store and %TEMP% onto D: to keep a release from
+          # filling the system drive. None of that survives the move and none of it needs to: a
+          # hosted runner is ephemeral, starts clean, and has ~85 GB free.
+          #
+          # **No self-hosted runner may ever be attached to this repository.** It is public, so a
+          # self-hosted runner would execute whatever a fork's pull request put in a workflow, on a
+          # machine somebody owns. That was safe in the private repository and is not safe here;
+          # the constraint inverted when the workflow moved, which is why every leg below is hosted.
+          - leg: windows-x86_64
+            runner: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+          # ---------------------------------------------------------------- macOS: aarch64 only
+          #
+          # **Hosted again, and this is the leg the move was worth most for.** Hosted macOS was the
+          # entire billed cost of a release on the private repository - $0.062/min against $0.010
+          # for Windows, and a 10x rather than 2x multiplier against included minutes - which is why
+          # it was disabled for months and then moved onto `kpzhang-mac-01`, an M4 mini wired into
+          # CI for this one job. On a **public** repository standard runners are free, so that
+          # multiplier applies to nothing and the mini is no longer load-bearing.
+          #
+          # `macos-latest` is arm64 (Apple silicon) and has been since `macos-14`, so it matches this
+          # leg's `aarch64-apple-darwin` target without naming a numbered image that will retire.
+          #
+          # `macos-13` is **retired** (December 2025), and the x86_64 hosted replacement is
+          # `macos-15-intel`, itself retiring in Fall 2027 - which is the reason the commented-out
+          # x86_64 leg below stays commented out rather than being switched back on now that hosted
+          # runners are free.
+          #
+          # macOS is built once per architecture rather than as one universal bundle, because a
+          # universal `.app` also needs a universal `cadre` sidecar and Tauri does not build that
+          # for you.
+          - leg: darwin-aarch64
+            runner: macos-latest
+            rust-target: aarch64-apple-darwin
+          # ---------------------------------------------------------------- darwin-x86_64: still off
+          #
+          # **No runner carries `[self-hosted, macOS, X64]`**, and a job whose labels match no runner
+          # does not fail - it queues, for GitHub's 24-hour limit, and is only then dropped. That is
+          # the shape of the `macos-13` observation above (84 minutes, no runner, no error), and it
+          # is the reason a leg with no machine behind it is worse than an absent one: it reports
+          # nothing while holding the run open. So this stays commented until either an Intel Mac
+          # joins the fleet or someone does the work to cross-compile it from the mini.
+          #
+          # Cross-compiling is not simply a matter of the `rust-target` below. Tauri bundles the
+          # `cadre` sidecar per architecture, so an x86_64 `.app` needs an x86_64 sidecar, and
+          # `update-manifest.mjs` would need to be handed both from one job rather than one per leg.
+          # Until that is built and measured, a missing leg is the honest state: the manifest already
+          # prints the platforms it left out, so Intel Macs are simply offered no update.
+          #
+          # - leg: darwin-x86_64
+          #   runner: macos-15-intel
+          #   rust-target: x86_64-apple-darwin
+          # ---------------------------------------------------------------- Linux: AppImage, x86_64
+          #
+          # Hosted, in a container - and **the container stays even though the host changed**.
+          #
+          # This was `liu-linux-01` (Manjaro, 28 cores), and it was the least reliable thing in the
+          # pipeline: it lost communication with the server twice in a row on the day of the move,
+          # both times mid-`Test`, with no verdict either time. Hosted Linux is the cheapest runner
+          # class there is (1x on private, free here), so there was never much holding this leg on a
+          # workstation.
+          #
+          # **The container is not about the host being Manjaro.** It is about glibc, and it would be
+          # needed on `ubuntu-latest` too:
+          #
+          #   * **glibc.** An AppImage bundles the app's libraries but not libc, so it runs only on
+          #     hosts at or above the glibc it was built against. `ubuntu-latest` is 24.04
+          #     (**2.39**), which would refuse to start on Debian 12, Ubuntu 22.04 and everything
+          #     else below that on the `WebKitGTK 2.38+` floor the README advertises. `ubuntu:22.04`
+          #     is **2.35**, which clears all of them. The old host was worse still (Manjaro, 2.43)
+          #     but the direction of the problem is identical.
+          #   * **VMware.** This one *is* gone with the host. `linuxdeploy-plugin-gtk` locates GTK
+          #     libraries with a recursive `find` under pkg-config's libdir, and VMware Workstation
+          #     shipped its own ancient GTK stack under `/usr/lib/vmware/lib/` on that machine,
+          #     which the find would return and the bundler would then die on. A hosted runner has
+          #     no VMware. Recorded because it is exactly the class of failure a container prevents
+          #     and a native build re-invites, if anyone is ever tempted to drop it.
+          #
+          # So the container keeps the leg reproducible rather than a property of one machine's
+          # library soup - which is now GitHub's image rather than a colleague's desktop, but is
+          # still not something this file should depend on. Hosted Ubuntu ships Docker.
+          #
+          # Nothing here pins `bundle.targets`, so this also builds a `.deb` and an `.rpm` that
+          # nothing uploads. They cost seconds - both bundlers are pure Rust, neither shells out to
+          # `dpkg` or `rpmbuild` - so narrowing the target list would buy less than the config
+          # divergence between this workflow and `installer.yml` would cost.
+          - leg: linux-x86_64
+            runner: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            container: ubuntu:22.04
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: always
+      # **Lets an AppImage run without FUSE.** `linuxdeploy` and its `appimage` plugin are
+      # themselves AppImages, and an AppImage normally self-mounts over FUSE - which a container
+      # cannot do without `--cap-add SYS_ADMIN --device /dev/fuse`. This variable makes them
+      # unpack to a temp dir and exec from there instead, so the leg needs no elevated container.
+      # Harmless on Windows and macOS, which never read it.
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+    steps:
+      # **Before `checkout`, because `checkout` needs `git`** - without it the action silently
+      # falls back to downloading a tarball over the REST API, which loses the git metadata the
+      # version step reads. A bare `ubuntu:22.04` has neither git nor a compiler.
+      #
+      # No proxy is configured here and that is deliberate. This box reaches every GitHub host
+      # except `github.com` itself, and its Clash instance is wired in through the *runner's*
+      # `.env` at `http://172.17.0.1:7897` - the docker0 gateway, which resolves to Clash from the
+      # host and from inside a bridge container alike. So the proxy stays a property of the
+      # machine, and this file names no host that only exists on one LAN.
+      #
+      # `rustup` is installed with `--default-toolchain none`: `dtolnay/rust-toolchain` below
+      # shells out to `rustup` and pins the version, so installing a toolchain here would download
+      # one twice and let the two disagree.
+      # `shell: bash` is not decoration. Inside a container the runner probes for bash and silently
+      # falls back to `sh -e {0}` when it does not find it - which on Ubuntu is dash, and dash
+      # answers `set -o pipefail` with "Illegal option". The image *does* ship /bin/bash 5.1, so
+      # naming it is enough; without it the step dies on its first line.
+      - name: Provision the container
+        if: ${{ matrix.container != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          # **The on-runner apt cache is gone with the runner it lived on**, and deliberately not
+          # replaced with `actions/cache`.
+          #
+          # These packages are ~250 MB. On `liu-linux-01` that download took ~1000s of a 1233s step
+          # and was the single most expensive thing in a release, so it was cached into `/__w` - the
+          # runner's `_work` directory, bind-mounted into every container job and therefore the one
+          # writable path that outlived the container. A hosted runner is ephemeral: `/__w` starts
+          # empty every time, so that trick would be an elaborate no-op.
+          #
+          # It is not worth reintroducing as an `actions/cache` round trip either, because the 1000s
+          # was a property of *that machine's* network - a box whose GitHub traffic went through a
+          # proxy and which measured 91 MB of artifact upload at 272s. A hosted runner sits beside
+          # Azure's Ubuntu mirrors and pulls the same packages in well under a minute, which is
+          # cheaper than restoring and saving a 250 MB cache entry would be.
+          #
+          # `update` still runs before `install`, as it always did: skipping it to save time
+          # resolves stale versions and then 404s at download, which is the classic way this
+          # optimisation turns into a broken build weeks later.
+          apt-get update -qq
+          # Three groups, and the third is the one that is easy to get wrong.
+          #
+          #   1. a toolchain and the things `checkout`/`pnpm`/`cargo` need;
+          #   2. Tauri's own documented Linux prerequisites (webkit, ssl, rsvg, xdo, appindicator);
+          #   3. **binaries the AppImage bundler and `linuxdeploy-plugin-gtk` shell out to.** These
+          #      are not linked against and so appear in no `-dev` package's dependencies, which is
+          #      why a build that compiles perfectly still dies at bundling. `xdg-utils` is the one
+          #      that bit (`xdg-open binary not found`); `libglib2.0-bin` carries
+          #      `glib-compile-schemas`, `libgdk-pixbuf2.0-dev` carries `gdk-pixbuf-query-loaders`,
+          #      and `librsvg2-common` is the pixbuf SVG loader without which the app's own icon
+          #      cannot be rasterised.
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl file git pkg-config \
+            desktop-file-utils patchelf xz-utils \
+            libwebkit2gtk-4.1-dev libssl-dev librsvg2-dev libxdo-dev \
+            libayatana-appindicator3-dev \
+            xdg-utils libglib2.0-bin libgdk-pixbuf2.0-dev librsvg2-common
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # **The private source, not this repository.** The whole tree, because this is the job that
+      # compiles it.
+      #
+      # `persist-credentials: false` is the load-bearing line here, and more so than it would be on
+      # a private repository: `actions/checkout` otherwise leaves the token in `.git/config`, where
+      # any later step - or any script the build runs - can read it out and print it into a build
+      # log that is **world-readable**. Nothing after this point pushes, so nothing needs it.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source-ref }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+
+      # No `cache: pnpm`, and no `Swatinem/rust-cache` below. Both are **redundant on a persistent
+      # runner and actively expensive**, which the first self-hosted run demonstrated: the
+      # `Post Run Swatinem/rust-cache` step spent longer compressing and uploading a multi-gigabyte
+      # Rust cache to GitHub than several of the build steps took, and it would do that on every
+      # run - for a machine whose `_work`, `CARGO_HOME` and target directories are still there when
+      # the next job starts.
+      #
+      # This matches what the rest of the repository already does on the persistent fleet, where
+      # `setup-go` runs with `cache: false` for the same reason (and
+      # `scripts/check-workflow-machine-scope.mjs` checks it).
+      #
+      # **Re-add both if a hosted leg ever returns to this matrix** - on an ephemeral runner the
+      # trade reverses completely and an uncached Rust build is the expensive thing.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: '1.96.0'
+          targets: ${{ matrix.rust-target }}
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # **Before anything is built**, because three different consumers read the version off disk
+      # and the bundler's `--config` override reaches only one of them:
+      #
+      #   * `vite.config.ts` reads `tauri.conf.json` to define the webview's `BUILD_VERSION`;
+      #   * `crates/Cargo.toml` becomes `env!("CARGO_PKG_VERSION")`, which a daemon reports as
+      #     `daemon.info.cadreVersion`.
+      #
+      # A nightly built with the override alone shipped an app calling itself `0.1.5` while the
+      # webview and the daemon both still said `0.1.0`. `daemonVersionSkew` compares those two,
+      # found them equal, and rendered nothing - so the "your engine is out of date" banner never
+      # appeared and the daemon stayed stale forever. That banner is the *entire* mechanism by which
+      # the daemon half of an update ever gets applied.
+      #
+      # **`--offline` below can only resolve what is already in `~/.cargo`, so this puts it there
+      # first.** The three persistent runners each have a cargo cache, and it is warm for whatever
+      # `Cargo.lock` said the last time they built - which is not the same thing as warm for what it
+      # says now. `liu-linux-01` failed its first release exactly here, with
+      #
+      #     error: failed to select a version for the requirement `toml = "^1"`
+      #            (locked to 1.1.4+spec-1.1.0)
+      #     candidate versions found which didn't match: 1.1.2+spec-1.1.0, ...
+      #     note: offline mode (via `--offline`) can sometimes cause surprising resolution failures
+      #
+      # which reads as a dependency problem and is a cache problem: 1.1.4 exists, the box had 1.1.2.
+      # A fresh runner is only the loudest case. **Any** runner hits this the first release after a
+      # dependency bump, because the step that would have fetched the new version is the build, and
+      # the build runs after this one.
+      #
+      # `--locked` rather than bare `fetch`, so this cannot itself move a dependency, and it runs
+      # *before* the stamp: afterwards the workspace version no longer matches `Cargo.lock` and
+      # `--locked` would refuse. Costs ~1s warm; cold it downloads what the build needs anyway.
+      - name: Warm the cargo registry cache
+        working-directory: crates
+        run: cargo fetch --locked
+
+      # `cargo update -w --offline` is not optional: changing the workspace version invalidates
+      # `Cargo.lock`, and the build below passes `--locked`, which then fails with
+      # "cannot update the lock file ... because --locked was passed". `-w` touches only workspace
+      # members and `--offline` forbids reaching the network, so no external dependency can move.
+      - name: Stamp the version
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          node packages/client/scripts/stamp-version.mjs --version "$VERSION"
+          node packages/client/scripts/stamp-version.mjs --version "$VERSION" --check
+          (cd crates && cargo update -w --offline)
+
+      # The client's **dependencies**, not the whole workspace. `beforeBuildCommand` rebuilds the
+      # client bundle itself, and it cannot resolve `@cadre/protocol` and friends until their `dist`
+      # exists - but nothing here needs `@cadre/api`, which is Go.
+      #
+      # `pnpm build` was what this ran, and it failed the first release outright: the recursive build
+      # reaches `services/api`, whose build script is `go build ./...`, and the macOS images have no
+      # `go` on PATH (`sh: go: command not found`). Adding `setup-go` would have fixed the symptom by
+      # installing a toolchain to build two server binaries a desktop installer does not contain.
+      #
+      # `@cadre/client...` is the package **and its dependencies** - adapter, crypto, protocol,
+      # transport. The other direction, `...@cadre/client`, selects dependents and resolves to the
+      # client alone, which would build nothing it needs.
+      - name: Build the client's dependencies
+        run: pnpm --filter "@cadre/client..." build
+
+      # The binary the app actually drives, bundled as a sidecar. Built here rather than left to
+      # `beforeBuildCommand` so a compile error in the CLI reads as one, and so the release link of
+      # the port's crates is timed separately from bundling.
+      - name: Build the native CLI
+        working-directory: crates
+        run: cargo build -p cadre-cli --release --locked
+
+      # `createUpdaterArtifacts` is passed here rather than committed to `tauri.conf.json`, and the
+      # reason is `installer.yml`: that workflow builds the same config with **no signing key**, and
+      # the CLI's error for that case ("A public key has been found, but no private key") is gated on
+      # a key being present. Rather than depend on whether an empty `pubkey` counts as present, the
+      # flag only exists in the one build that has a key to sign with. Same boundary as the feed URL
+      # and the pubkey: the committed config describes the app, this workflow describes our release.
+      #
+      # `shell: bash` is load-bearing on Windows. The default there is PowerShell, which strips the
+      # double quotes out of the `--config` argument: the first release run died with
+      # `invalid value '{bundle:{createUpdaterArtifacts:true}}' ... key must be a string`. bash is
+      # present on all three images, so one shell keeps the three legs honest.
+      - name: Build and sign
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Written as a file rather than passed as a JSON string. Two reasons, both learned the
+          # hard way: PowerShell strips the quotes out of an inline `--config` (which is why this
+          # step also pins `shell: bash`), and the override is no longer small enough to read as a
+          # one-liner.
+          node -e '
+            const fs = require("fs");
+            fs.writeFileSync(process.argv[1], JSON.stringify({
+              // No `version` here: it is stamped into tauri.conf.json above, where vite and cargo
+              // can see it too. Overriding it here as well would be a second source of truth.
+              bundle: { createUpdaterArtifacts: true },
+              plugins: { updater: {
+                pubkey: process.env.CADRE_UPDATE_PUBKEY,
+                endpoints: [process.env.CADRE_UPDATE_FEED_URL],
+              } },
+            }, null, 2));
+          ' "$RUNNER_TEMP/tauri.override.json"
+          pnpm --filter @cadre/client tauri build --config "$RUNNER_TEMP/tauri.override.json"
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          # Signs the update artifact. Without these the bundler emits no `.sig` and
+          # `update-manifest.mjs` fails rather than publishing an entry every client would reject.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # What makes this build *ours*: the feed it polls and the key it trusts.
+          #
+          # These reach the artifact **twice, by two different routes, and both are needed.**
+          # `src-tauri/src/update.rs` reads them through `option_env!` at compile time - that is the
+          # switch that leaves a fork's build with no updater at all. The *bundler* reads
+          # `plugins.updater.pubkey` from the config when `createUpdaterArtifacts` is on, and the
+          # committed config carries `""` on purpose, so without the override above it fails with
+          # `failed to decode pubkey: Missing comment in public key` - an empty string is valid
+          # base64 that decodes to nothing. One secret feeds both, so they cannot disagree.
+          # **The EdgeOne mirror when it is configured, GitHub otherwise**, because this is the one
+          # URL a client cannot be told about later: it is compiled in, so whatever is chosen here
+          # is what that build polls for the rest of its life. Users on the network this project is
+          # developed on reach GitHub slowly and unreliably, and an update check that times out is
+          # an update that never happens.
+          #
+          # **Both feeds are published on every release and must stay that way.** Every build
+          # shipped before this line changed polls the GitHub URL forever, so retiring it would
+          # silently freeze those installs - the updater reports no error when a feed simply stops
+          # being updated. The two manifests differ only in where the bytes are served from; the
+          # signatures are over the artifact, so either is verifiable against the same key.
+          #
+          # On the GitHub side: the literal `latest` tag, not `/releases/latest/download/` - that
+          # path is GitHub's "most recent release" redirect, which resolves by release order rather
+          # than by name and would silently follow any other release someone published. This URL
+          # names exactly the one thing the publish step writes.
+          CADRE_UPDATE_FEED_URL: ${{ vars.CADRE_DOWNLOAD_SITE_BASE != '' && format('{0}/latest.json', vars.CADRE_DOWNLOAD_SITE_BASE) || format('https://github.com/{0}/releases/download/latest/latest.json', env.RELEASES_REPO) }}
+          CADRE_UPDATE_PUBKEY: ${{ secrets.CADRE_UPDATE_PUBKEY }}
+          # The relay this distribution offers at sign-in, matching `installer.yml` - and that
+          # "matching" is load-bearing rather than decorative, which is how this line came to be
+          # wrong. `installer.yml` moved to `cadre.tc-imba.com` in the commit before this one
+          # because **`cadre.alayalab.ai` has no A record**: public DNS returns NXDOMAIN for it
+          # (re-checked against 8.8.8.8 on 2026-08-31, while `cadre.tc-imba.com` answers
+          # 47.115.33.32). This file was left behind, so every nightly kept baking the dead host
+          # into the artifact users actually install - a prominent first-run sign-in button that
+          # resolves to nothing, which is the exact failure the option exists to prevent. The
+          # packaging check and the real release must name one host or the check proves nothing
+          # about the release.
+          CADRE_OFFICIAL_RELAY_URL: https://cadre.tc-imba.com
+
+      # `if-no-files-found: error`, because the halves are equally load-bearing: an installer with
+      # no `.sig` is unusable to the updater, and a `.sig` with no installer is a manifest entry
+      # pointing at nothing.
+      #
+      # **The `.dmg` is what a human downloads; the `.app.tar.gz` is what the updater consumes**,
+      # and macOS needs both. Tauri's `.app.tar.gz` is a bare `Gear Cadre.app` in a tarball — no
+      # version in the name, no Applications shortcut, and Safari unpacks it into Downloads where
+      # Gatekeeper is at its least forgiving. It exists so `tauri-plugin-updater` has something to
+      # swap in place, not so anyone installs from it. Without the `.dmg` here, a macOS user has no
+      # first install at all: `latest.json` only ever offers an *upgrade* to a client that is
+      # already running.
+      #
+      # The bundler already builds it (`bundle.targets: "all"`), so this uploads work that was
+      # being thrown away. It costs the macOS leg its headless-ness rather than any build time:
+      # Tauri's DMG bundler drives Finder over AppleScript and so needs a real Aqua session, which
+      # is why `kpzhang-mac-01` runs the runner as a per-user LaunchAgent under auto-login rather
+      # than as a LaunchDaemon. Dropping the `.dmg` again is the only thing that would buy that
+      # back.
+      #
+      # Adding a second bundle directory moves the artifact's internal root up to `bundle/`, so a
+      # macOS artifact now contains `macos/…` and `dmg/…` rather than the two files at its top
+      # level. Nothing downstream cares — `update-manifest.mjs` walks recursively and `gh release
+      # upload` flattens to basenames — but it is why the layout changes shape in the publish log.
+      #
+      # **Linux is not the macOS split — it is the Windows one.** Under `createUpdaterArtifacts:
+      # true` the updater *reuses* the shipped bundle wherever that bundle is a single file, so
+      # Linux gets `*.AppImage` plus `*.AppImage.sig` exactly as Windows gets `*-setup.exe` plus
+      # `*-setup.exe.sig`. Only macOS needs a second artifact, because a `.app` is a directory and
+      # cannot be one file. So there is no `.AppImage.tar.gz` here to look for: that is the legacy
+      # `v1Compatible` layout, which this workflow does not ask for.
+      #
+      # **What that AppImage will run on is decided by the container, not by this step** — see the
+      # `linux-x86_64` matrix entry. It is built in `ubuntu:22.04`, so its glibc floor is 2.35 and
+      # it covers Ubuntu 22.04+, Debian 12+ and current Fedora. Building it on the runner's own
+      # Manjaro would raise that floor to 2.43 and exclude nearly all of them.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.leg }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            packages/client/src-tauri/target/release/bundle/nsis/*-setup.exe
+            packages/client/src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+            packages/client/src-tauri/target/release/bundle/macos/*.app.tar.gz
+            packages/client/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+            packages/client/src-tauri/target/release/bundle/dmg/*.dmg
+            packages/client/src-tauri/target/release/bundle/appimage/*.AppImage
+            packages/client/src-tauri/target/release/bundle/appimage/*.AppImage.sig
+
+  publish:
+    name: publish the feed
+    needs: [version, build]
+    # Not `success()`: a release with one platform missing is better than no release, and the
+    # manifest script prints which legs it left out rather than hiding the gap.
+    if: ${{ !cancelled() }}
+    # `ubuntu-latest`, which is now what every job here uses rather than the exception it was: this
+    # job's whole second half is `gh`, preinstalled on the hosted image and absent from the
+    # self-hosted fleet it used to sit beside - the one-line change that broke #298 in the private
+    # repository. Nothing self-hosted can be attached to a public repository anyway (see the
+    # Windows leg), so the hazard is gone rather than merely avoided.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The only job that writes anything. `contents: write` creates the releases and uploads the
+    # assets; the top-level default stays `read` so the build legs, which handle the signing key,
+    # cannot write to this repository at all.
+    permissions:
+      contents: write
+    # **Job level, not step level, and that is forced rather than stylistic**: the `secrets` context
+    # is not available in a step's `if:`, so a step cannot ask whether its own credential exists. A
+    # job-level `env` can, and `env` *is* readable from a step `if`. Both mirror steps below gate on
+    # these, so a fork with neither set publishes to GitHub exactly as before instead of failing in
+    # a step it has no credentials for.
+    env:
+      HAVE_EDGEONE_TOKEN: ${{ secrets.EDGEONE_API_TOKEN != '' }}
+      SITE_BASE: ${{ vars.CADRE_DOWNLOAD_SITE_BASE }}
+    steps:
+      # The source again, for one reason: `update-manifest.mjs` lives in it. Sparse, because that
+      # script and its neighbours are all this job runs - it never builds anything.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source-ref }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: packages/client/scripts
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+
+      # `productName` is "Gear Cadre", so every installer this bundles has a **space in its name** -
+      # and that broke publishing twice over.
+      #
+      #   * `xargs` splits on whitespace, so the upload was handed `.../nsis/Gear` and failed with
+      #     `no matches found`. (The commands below now use null delimiters regardless.)
+      #   * GitHub renames release assets itself, replacing each space with a period. So even a
+      #     correct upload would land as `Gear.Cadre_0.1.5_x64-setup.exe` while the manifest, built
+      #     from the local filename, pointed at `Gear%20Cadre_...` - a URL that 404s for every
+      #     client, on a release that looked perfectly published.
+      #
+      # Renaming here, before the manifest is composed, makes the local name, the asset name and the
+      # URL the same string. Doing the same substitution GitHub does keeps that true.
+      - name: Normalise artifact names
+        shell: bash
+        run: |
+          set -euo pipefail
+          find artifacts -depth -name '* *' -print0 | while IFS= read -r -d '' f; do
+            mv "$f" "$(dirname "$f")/$(basename "$f" | tr ' ' '.')"
+          done
+          find artifacts -type f | sort
+
+      # **Two manifests, because there are two releases and each must describe itself.**
+      #
+      # The rolling `latest` release needs URLs under `/download/latest/`, which is what shipped
+      # clients poll and must never move. The archival `v<version>` release needs URLs under its own
+      # tag - if it carried the rolling ones, every archived manifest would silently start
+      # describing whatever was published *last* rather than what sits beside it, which is the exact
+      # property an archive exists to not have.
+      #
+      # `update-manifest.mjs` always writes `<dir>/latest.json`, so this runs it twice and stashes
+      # each result. The rolling one is restored last because the upload step reads it from there.
+      #
+      # **The archive's copy is stashed in its own directory rather than under another name**, and
+      # that is not tidiness: `gh release upload` names the asset after the file's basename, so a
+      # file called `latest.versioned.json` publishes an archive whose manifest is at
+      # `/download/v<version>/latest.versioned.json` and whose `/latest.json` is a 404. That is
+      # exactly what v0.1.14 shipped with. The directory keeps the basename right.
+      - name: Compose the manifests
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/${RELEASES_REPO}/releases/download"
+
+          mkdir -p "$RUNNER_TEMP"/versioned
+          node packages/client/scripts/update-manifest.mjs \
+            --version "$VERSION" --base-url "$base/v$VERSION" --dir artifacts > /dev/null
+          cp artifacts/latest.json "$RUNNER_TEMP"/versioned/latest.json
+
+          node packages/client/scripts/update-manifest.mjs \
+            --version "$VERSION" --base-url "$base/${RELEASE_TAG}" --dir artifacts \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # **Two releases per publish, and they are not redundant.**
+      #
+      #   * `v<version>` is the archive. It is created once, never pruned and never replaced, so
+      #     every build that ever shipped stays downloadable and there is something to roll back
+      #     *to*. This is what the previous single-rolling-release design could not offer: replacing
+      #     one release deletes its assets, so the history was one build deep.
+      #   * `latest` is an alias, and it exists because **shipped clients have a URL compiled into
+      #     them**. `CADRE_UPDATE_FEED_URL` is baked in at build time and points at
+      #     `/releases/download/latest/latest.json`, so that path must keep resolving to the newest
+      #     build forever. A tag that moved would break it; a tag per version cannot serve it.
+      #
+      # The archive is written first and the alias last. A client polling mid-publish then either
+      # sees the previous release in full or the new one in full - never a manifest naming assets
+      # that are still uploading.
+      #
+      # Nightlies take a version each (`0.1.<run_number>`), so releases accumulate at roughly one a
+      # day. That is the intended trade: cheap on GitHub, and the alternative is having no history.
+      - name: Publish
+        shell: bash
+        env:
+          # **The job's own token, and `RELEASES_REPO_TOKEN` is gone.** Before the move this
+          # workflow ran in the private repository and wrote releases into a different one, which
+          # needed a long-lived PAT with write access here. Now it runs *in* the repository it
+          # publishes to, so the token GitHub mints per run is sufficient - scoped to this
+          # repository, expiring with the job, and impossible to leave lying around. That is the one
+          # unambiguous security improvement the move made.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          notes="CADRE ${version}. Unsigned by Apple/Microsoft; see the source repository's docs/install.md."
+
+          # `-print0` / `-0` throughout: `productName` has a space in it, and while the
+          # normalisation step above has already removed those, a path list split on whitespace is
+          # the kind of bug that comes back the moment somebody renames the product.
+          find artifacts -type f ! -name latest.json -print0 | sort -z > "$RUNNER_TEMP"/uploads.nul
+          if [ ! -s "$RUNNER_TEMP"/uploads.nul ]; then
+            echo "::error::no artifacts to publish" >&2
+            exit 1
+          fi
+
+          # No `--target`: it would have to name a commitish **in the releases repository**, and the
+          # SHA that produced this build lives in the source repository instead. So the tag lands on
+          # that repo's default branch HEAD, which is meaningless but harmless - it holds no source,
+          # and the tag is only ever a label for a set of assets.
+          #
+          # `edit` after `create` rather than instead of it: the title has to be reasserted on every
+          # publish for the alias, whose tag never changes, and asserting it unconditionally means
+          # the two paths cannot drift.
+          publish_to() {
+            local tag="$1" title="$2" manifest="$3"
+            if gh release view "$tag" --repo "$RELEASES_REPO" >/dev/null 2>&1; then
+              gh release edit "$tag" --repo "$RELEASES_REPO" --title "$title" --notes "$notes"
+            else
+              gh release create "$tag" --repo "$RELEASES_REPO" --title "$title" --notes "$notes"
+            fi
+            xargs -0 -a "$RUNNER_TEMP"/uploads.nul \
+              gh release upload "$tag" --repo "$RELEASES_REPO" --clobber
+            gh release upload "$tag" --repo "$RELEASES_REPO" --clobber "$manifest"
+          }
+
+          # --- the archive -------------------------------------------------------------------
+          # Re-running the same version overwrites its own assets (--clobber) rather than failing,
+          # which is what makes a re-dispatch of a failed publish safe.
+          publish_to "v$version" "CADRE $version" "$RUNNER_TEMP"/versioned/latest.json
+
+          # --- the alias ---------------------------------------------------------------------
+          publish_to "$RELEASE_TAG" "CADRE $version (latest)" artifacts/latest.json
+
+          # Prune what an earlier release left behind - **on the alias only**. Installer filenames
+          # carry the version, so without this the alias accumulates every build ever published and
+          # offers stale downloads beside the current one. The archive is deliberately not pruned:
+          # keeping its assets is its entire purpose.
+          xargs -0 -a "$RUNNER_TEMP"/uploads.nul -n1 basename > "$RUNNER_TEMP"/keep.txt
+          echo latest.json >> "$RUNNER_TEMP"/keep.txt
+          gh release view "$RELEASE_TAG" --repo "$RELEASES_REPO" --json assets --jq '.assets[].name' > "$RUNNER_TEMP"/have.txt
+          while IFS= read -r asset; do
+            if ! grep -qxF "$asset" "$RUNNER_TEMP"/keep.txt; then
+              echo "pruning stale asset: $asset"
+              gh release delete-asset "$RELEASE_TAG" "$asset" --repo "$RELEASES_REPO" --yes
+            fi
+          done < "$RUNNER_TEMP"/have.txt
+
+          # **`v<version>` is marked GitHub's "Latest", not the alias.** Those are different things
+          # sharing a word: `/releases/download/latest/` is the tag literally named `latest`, while
+          # `/releases/latest` is GitHub's redirect to whichever release carries this flag. Pointing
+          # the flag at the real version means the repo's front page and that redirect both name a
+          # build someone can reason about, while the alias keeps serving the compiled-in feed.
+          gh release edit "v$version" --repo "$RELEASES_REPO" --latest
+          gh release edit "$RELEASE_TAG" --repo "$RELEASES_REPO" --latest=false
+
+          {
+            echo "published CADRE $version"
+            echo "- archive: https://github.com/${RELEASES_REPO}/releases/tag/v${version}"
+            echo "- alias:   https://github.com/${RELEASES_REPO}/releases/tag/${RELEASE_TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------ EdgeOne: the fast mirror
+      #
+      # **GitHub is the source of truth; this is a CDN in front of it for the network most of these
+      # users are on.** Downloads from `github.com` are slow to unreachable there - the same
+      # throttling that makes `actions/checkout` fail on the Linux runner - so the release page and
+      # the artifacts small enough to carry are mirrored onto Tencent EdgeOne Pages.
+      #
+      # `build-download-site.mjs` measures every artifact against EdgeOne's **25 MB per-file
+      # ceiling** and mirrors only what fits. Today that is the Windows installer, the `.dmg` and
+      # the macOS updater tarball; the 91 MB AppImage keeps its GitHub URL and the page says so.
+      # A per-file decision rather than a hard cap check, because an installer that grows past
+      # 25 MB should become a slower download and a line in the log, not a failed release.
+      #
+      # **Gated on two settings existing rather than assumed**, so a fork - or this repository
+      # before the site's custom domain is bound - publishes to GitHub exactly as before instead of
+      # failing in a step it has no credentials for. `vars.CADRE_DOWNLOAD_SITE_BASE` is the public
+      # origin (EdgeOne's preset `*.edgeone.cool` domain answers 401 to the world, so this only
+      # becomes useful once a real domain is attached in the console).
+      - name: Mirror the release to EdgeOne Pages
+        if: ${{ env.SITE_BASE != '' && env.HAVE_EDGEONE_TOKEN == 'true' }}
+        shell: bash
+        env:
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
+          # The project must already exist and be of the **direct upload** type. `deploy -n` CREATES
+          # a project when the name is free, so a typo here does not fail - it silently publishes a
+          # perfectly good release to a new empty project nobody is looking at.
+          SITE_PROJECT: ${{ vars.CADRE_DOWNLOAD_SITE_PROJECT || 'gear-cadre' }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          node packages/client/scripts/build-download-site.mjs \
+            --version "$version" \
+            --dir artifacts \
+            --out "$RUNNER_TEMP"/site \
+            --template deploy/download-site \
+            --feed "$RUNNER_TEMP"/versioned/latest.json \
+            --site-base "$SITE_BASE" \
+            --github-base "https://github.com/${RELEASES_REPO}/releases/download/v${version}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # Pinned: an unpinned `npx edgeone` is a floating dependency in the publish path of a
+          # release. Same reasoning as the SHA pins on every action above.
+          npx --yes edgeone@1.6.21 makers deploy "$RUNNER_TEMP"/site \
+            -n "$SITE_PROJECT" -t "$EDGEONE_API_TOKEN" -e production
+
+          echo "- mirror:  ${SITE_BASE}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Proves the mirror serves *this* build rather than that the upload returned 0. Reads the
+      # manifest the deploy just published and compares its version; a stale CDN edge or a deploy
+      # that landed in the wrong project both show up here as a mismatch.
+      - name: Verify the mirror serves this build
+        if: ${{ env.SITE_BASE != '' && env.HAVE_EDGEONE_TOKEN == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          want="${{ needs.version.outputs.version }}"
+          for attempt in 1 2 3 4 5 6; do
+            got=$(curl -fsS --max-time 20 "${SITE_BASE}/downloads.json" \
+              | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
+                  try { process.stdout.write(String(JSON.parse(s).version||'')); } catch { process.stdout.write(''); }
+                });") || got=""
+            if [ "$got" = "$want" ]; then
+              echo "${SITE_BASE} serves $got"
+              exit 0
+            fi
+            echo "attempt $attempt: serves ${got:-<nothing>}, want $want - waiting for propagation"
+            sleep 20
+          done
+          echo "::error::${SITE_BASE} does not serve $want" >&2
+          exit 1
