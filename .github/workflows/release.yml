@@ -563,19 +563,47 @@ jobs:
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
 
-      # No `cache: pnpm`, and no `Swatinem/rust-cache` below. Both are **redundant on a persistent
-      # runner and actively expensive**, which the first self-hosted run demonstrated: the
-      # `Post Run Swatinem/rust-cache` step spent longer compressing and uploading a multi-gigabyte
-      # Rust cache to GitHub than several of the build steps took, and it would do that on every
-      # run - for a machine whose `_work`, `CARGO_HOME` and target directories are still there when
-      # the next job starts.
+      # **Rust is cached and nothing else is**, which is a measurement rather than a preference.
       #
-      # This matches what the rest of the repository already does on the persistent fleet, where
-      # `setup-go` runs with `cache: false` for the same reason (and
-      # `scripts/check-workflow-machine-scope.mjs` checks it).
+      # The first release built from hosted runners (run #1, 2026-09-02) timed the Linux leg at
+      # 825s total:
       #
-      # **Re-add both if a hosted leg ever returns to this matrix** - on an ephemeral runner the
-      # trade reverses completely and an uncached Rust build is the expensive thing.
+      #     Build and sign (rust)              315s
+      #     Build the native CLI (rust)        296s   -> 611s, 74% of the leg
+      #     Provision the container (apt)      103s
+      #     Build the client's dependencies     64s
+      #     Install (pnpm)                       9s
+      #
+      # Windows and macOS have the same shape - `Build the native CLI` alone was 583s and 544s.
+      # So three quarters of every leg is rustc, and everything else is rounding: caching a 9s pnpm
+      # install or a 103s apt would add moving parts for no measurable gain. If a future measurement
+      # says otherwise, cache that too; do not cache it on principle.
+      #
+      # The version of this file that ran on self-hosted runners carried the opposite instruction,
+      # and it was right for its runners: `Post Run Swatinem/rust-cache` spent longer compressing
+      # and uploading a multi-gigabyte cache than several build steps took, on a machine whose
+      # `target/` was still there when the next job started. Its own note said
+      # "**re-add both if a hosted leg ever returns to this matrix** - on an ephemeral runner the
+      # trade reverses completely", and every leg here is hosted, so it has.
+      #
+      # Two things this does *not* do, worth knowing before reading a timing:
+      #
+      #   * **It caches dependencies, not this workspace.** `rust-cache` deliberately evicts the
+      #     workspace members so they rebuild; the saving is the dependency graph, which for
+      #     Tauri + WebKitGTK is the bulk of it. A change to `cadred` still recompiles `cadred`.
+      #   * **A cache unused for 7 days is evicted.** This workflow only runs on dispatch, so a
+      #     release cadence slower than weekly will often find a cold cache and save nothing. That
+      #     is not a regression when it happens; it is this line's known limit.
+      #
+      # `key` is the leg, so the three do not overwrite each other, and `save-if` keeps writes to
+      # `main` - a dispatch against a branch reads the cache but does not replace it with one built
+      # from unmerged code.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.leg }}
+          save-if: ${{ inputs.source-ref == 'main' }}
+
+      # No `cache: pnpm`. `Install` is 9-19s across the three legs; see the measurement above.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '22'
@@ -812,16 +840,46 @@ jobs:
       HAVE_EDGEONE_TOKEN: ${{ secrets.EDGEONE_API_TOKEN != '' }}
       SITE_BASE: ${{ vars.CADRE_DOWNLOAD_SITE_BASE }}
     steps:
-      # The source again, for one reason: `update-manifest.mjs` lives in it. Sparse, because that
-      # script and its neighbours are all this job runs - it never builds anything.
+      # The source again, because the scripts this job runs live in it. Sparse, because it never
+      # builds anything - but sparse over **two** paths, not one, and the second is easy to forget:
+      #
+      #   * `packages/client/scripts` - `update-manifest.mjs` and `build-download-site.mjs`;
+      #   * `deploy/download-site` - the page `build-download-site.mjs` copies, which it takes as
+      #     `--template` rather than generating.
+      #
+      # The first release from this repository shipped with only the first of those and the mirror
+      # step died on `ENOENT: no such file or directory, scandir 'deploy/download-site'` **after**
+      # the GitHub release had already published. That is the failure mode this narrowing invites:
+      # the publish half succeeded, the mirror half did not, and a missing path in a sparse checkout
+      # looks nothing like the thing it breaks. A non-sparse checkout would have cost a slower fetch
+      # and none of that, which is the trade to remember if a third path ever appears.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ inputs.source-ref }}
           token: ${{ secrets.SOURCE_READ_TOKEN }}
           persist-credentials: false
-          sparse-checkout: packages/client/scripts
+          sparse-checkout: |
+            packages/client/scripts
+            deploy/download-site
           sparse-checkout-cone-mode: false
+
+      # Proof the checkout above actually produced what the mirror needs, before ~20 minutes of
+      # artifacts are downloaded and a release is published that the mirror step then fails behind.
+      # A sparse checkout that silently omits a path is otherwise only discovered at the end.
+      - name: The scripts and the page template are both present
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in packages/client/scripts/update-manifest.mjs \
+                      packages/client/scripts/build-download-site.mjs \
+                      deploy/download-site; do
+            [ -e "$path" ] || {
+              echo "::error::the sparse checkout did not produce $path; widen sparse-checkout above" >&2
+              exit 1
+            }
+          done
+          echo "checkout carries the manifest script, the site builder and the page template"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
