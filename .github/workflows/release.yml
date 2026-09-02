@@ -105,11 +105,11 @@ on:
         required: false
         default: main
       runners:
-        description: 'Which fleet builds this (hosted is the only safe default here)'
+        description: 'Which fleet builds this'
         required: false
-        default: hosted
+        default: self-hosted
         type: choice
-        options: [hosted, self-hosted]
+        options: [self-hosted, hosted]
 
 concurrency:
   group: release-${{ github.ref }}
@@ -374,10 +374,24 @@ jobs:
   build:
     needs: version
     name: ${{ matrix.leg }}
-    # **`self-hosted` is a benchmark setting, not a mode to leave on.** This repository is public, so
-    # a self-hosted runner here executes whatever a fork's pull request puts in a workflow, on a
-    # machine somebody owns - the hazard the Windows leg's comment describes at length. It exists to
-    # measure the two fleets against each other and should return to `hosted` immediately after.
+    # **Self-hosted by default, on measured evidence** - and with a standing hazard attached.
+    #
+    # Both fleets were timed on the same commit. Self-hosted won every leg, and macOS was not close:
+    #
+    #     leg       hosted cold   hosted warm   self-hosted
+    #     linux           821s          673s         542s
+    #     darwin          898s         1143s         353s     ~3x
+    #     windows        1009s         1177s         632s
+    #
+    # The Linux number is the interesting one: its *compile* is 2.8x faster self-hosted (234s against
+    # 654s), but `Provision the container` costs 231s there against 48-66s hosted, because apt is slow
+    # on that box's network. Most of the win is spent re-downloading the same ~250 MB of packages, and
+    # that step - not the compiler - is what to attack next on Linux.
+    #
+    # **The hazard this accepts:** this repository is public, so a self-hosted runner here executes
+    # whatever a fork's pull request puts in a workflow, on a machine somebody owns. That is a real
+    # exposure, chosen deliberately rather than overlooked; `hosted` remains one dispatch input away
+    # if it ever needs revisiting.
     runs-on: ${{ inputs.runners == 'self-hosted' && matrix.self-runner || matrix.runner }}
     # Empty for every leg but Linux, which is how a matrix opts one job into a container: an unset
     # `container` is no container at all, so Windows and macOS are untouched by this line.
@@ -613,6 +627,23 @@ jobs:
       #     release cadence slower than weekly will often find a cold cache and save nothing. That
       #     is not a regression when it happens; it is this line's known limit.
       #
+      # **`workspaces:` is not optional here, and leaving it out cached nothing at all.**
+      #
+      # `rust-cache` looks for a Cargo workspace at the repository root by default. This checkout has
+      # none: the source keeps two separate workspaces, `crates` and `packages/client/src-tauri`,
+      # each with its own `Cargo.lock` and its own `target/`. With nothing at the root the action
+      # still ran, still reported success, and still wrote a cache entry - an **empty** one, keyed
+      # `...-da39a3ee`, which is the SHA-1 of the empty string. Four such entries totalling 0 MB sat
+      # in this repository's cache before anyone looked, and the Linux leg produced none at all.
+      #
+      # That is also the explanation for the first cache measurement, where a "warm" run came out
+      # *slower* than a cold one on two of three legs: nothing was ever restored, so the difference
+      # was hosted-runner variance and the cache was not being measured at all.
+      #
+      # Naming both workspaces caches both dependency graphs and both target directories. They are
+      # genuinely separate builds - 451 packages against 523, of which only 156 match on name *and*
+      # version - so caching one would leave most of the other uncached.
+      #
       # `key` is the leg, so the three do not overwrite each other, and `save-if` keeps writes to
       # `main` - a dispatch against a branch reads the cache but does not replace it with one built
       # from unmerged code.
@@ -620,6 +651,9 @@ jobs:
         with:
           key: ${{ matrix.leg }}
           save-if: ${{ inputs.source-ref == 'main' }}
+          workspaces: |
+            crates
+            packages/client/src-tauri
 
       # No `cache: pnpm`. `Install` is 9-19s across the three legs; see the measurement above.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -1098,13 +1132,49 @@ jobs:
             --github-base "https://github.com/${RELEASES_REPO}/releases/download/v${version}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # **The Pages copy links every artifact to GitHub Releases and bundles none of them.**
+      #
+      # The two hosts want different things from the same generator. EdgeOne is a CDN and serving the
+      # installers from it is the entire point, so the build above copies in whatever clears the
+      # 25 MB ceiling. Pages is a static host for the *page*: the artifacts already have a canonical
+      # home on the release it describes, and copying them here would publish a second copy of every
+      # installer - against Pages' own size budget, without range requests or resumable downloads,
+      # and stale the moment a release asset is replaced.
+      #
+      # So the page is generated twice from one set of artifacts, and `--no-mirror` is the only
+      # difference: it leaves `mirrored` empty, so every URL resolves to `--github-base`.
+      - name: Build the download page for Pages, linking out to the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          node packages/client/scripts/build-download-site.mjs \
+            --version "$version" \
+            --dir artifacts \
+            --out "$RUNNER_TEMP"/site-pages \
+            --template deploy/download-site \
+            --feed "$RUNNER_TEMP"/versioned/latest.json \
+            --site-base "https://alayagear.github.io/gear-cadre-releases" \
+            --github-base "https://github.com/${RELEASES_REPO}/releases/download/v${version}" \
+            --no-mirror \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # Cheap proof of the flag's whole purpose: an installer copied in here would be a second
+          # copy of a release asset, published from the wrong place.
+          if find "$RUNNER_TEMP"/site-pages -maxdepth 1 \
+               \( -name '*.exe' -o -name '*.AppImage' -o -name '*.dmg' -o -name '*.tar.gz' \) \
+               | grep -q .; then
+            echo "::error::the Pages site bundled an artifact; --no-mirror did not take effect" >&2
+            exit 1
+          fi
+
       # Pages takes the directory as an artifact here and deploys it from a separate job below,
       # which is the shape `deploy-pages` requires: the deployment needs `pages: write` and
       # `id-token: write`, and granting those to *this* job would hand them to every step that
       # handles the signing key.
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: ${{ runner.temp }}/site
+          path: ${{ runner.temp }}/site-pages
 
       - name: Mirror the release to EdgeOne Pages
         if: ${{ env.SITE_BASE != '' && env.HAVE_EDGEONE_TOKEN == 'true' }}
