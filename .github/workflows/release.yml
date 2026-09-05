@@ -1194,6 +1194,52 @@ jobs:
         with:
           path: ${{ runner.temp }}/site-pages
 
+      # **The EdgeOne site travels as an artifact, and the upload to EdgeOne happens elsewhere.**
+      #
+      # It used to be two more steps right here, and that coupling cost a release: run #8's mirror
+      # died in `npx` (an npm tree-resolution crash, nothing to do with this repository), which
+      # failed *this* job -- and `pages` is gated on this job succeeding, so the GitHub Pages copy of
+      # the download page was skipped too. The GitHub release itself had already published. One
+      # optional CDN upload took out the one destination that needs no credentials at all.
+      #
+      # The two publishers are now siblings (`mirror` and `pages` below), both depending on this job
+      # and neither on the other, so either can fail without touching the other's output. This step
+      # is the seam: the bytes are built once, here, and carried rather than rebuilt.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: download-site-edgeone
+          path: ${{ runner.temp }}/site
+          if-no-files-found: error
+          retention-days: 7
+
+  # The same page, mirrored to EdgeOne's CDN for readers who reach GitHub slowly or not at all.
+  #
+  # **A sibling of `pages`, not a step inside `publish`.** Both hang off the same successful publish
+  # and neither hangs off the other, which is the whole point: this one needs a third-party token and
+  # a third-party CLI installed from npm at run time, and it has already failed for reasons that had
+  # nothing to do with the release (run #8: `npm error Cannot read properties of null (reading
+  # 'edgesOut')`). When it was a step in `publish`, that failure skipped the Pages deploy as well.
+  #
+  # It deliberately holds **no** write permission on this repository. The release and its assets are
+  # already published by the time this runs; all this job can do is put a copy of the page on a CDN,
+  # or fail trying.
+  mirror:
+    name: mirror the download page to EdgeOne
+    needs: [version, publish]
+    if: ${{ needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Job level rather than step level, for the reason `publish` gives: the `secrets` context is not
+    # readable from a step's `if:`, and `env` is.
+    env:
+      HAVE_EDGEONE_TOKEN: ${{ secrets.EDGEONE_API_TOKEN != '' }}
+      SITE_BASE: ${{ vars.CADRE_DOWNLOAD_SITE_BASE }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: download-site-edgeone
+          path: ${{ runner.temp }}/site
+
       - name: Mirror the release to EdgeOne Pages
         if: ${{ env.SITE_BASE != '' && env.HAVE_EDGEONE_TOKEN == 'true' }}
         shell: bash
@@ -1207,10 +1253,23 @@ jobs:
           set -euo pipefail
           # Pinned: an unpinned `npx edgeone` is a floating dependency in the publish path of a
           # release. Same reasoning as the SHA pins on every action above.
-          npx --yes edgeone@1.6.21 makers deploy "$RUNNER_TEMP"/site \
-            -n "$SITE_PROJECT" -t "$EDGEONE_API_TOKEN" -e production
-
-          echo "- mirror:  ${SITE_BASE}" >> "$GITHUB_STEP_SUMMARY"
+          #
+          # Retried, because the failure that prompted this job's existence was `npm` resolving its
+          # own dependency tree rather than anything about this release - the kind of thing a second
+          # attempt fixes. A clean cache between attempts, because a half-written tree is what
+          # `edgesOut` on a null node means.
+          for attempt in 1 2 3; do
+            if npx --yes edgeone@1.6.21 makers deploy "$RUNNER_TEMP"/site \
+                 -n "$SITE_PROJECT" -t "$EDGEONE_API_TOKEN" -e production; then
+              echo "- mirror:  ${SITE_BASE}" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "attempt $attempt failed; clearing the npm cache and retrying" >&2
+            npm cache clean --force || true
+            sleep 10
+          done
+          echo "::error::the EdgeOne deploy failed three times" >&2
+          exit 1
 
       # Proves the mirror serves *this* build rather than that the upload returned 0. Reads the
       # manifest the deploy just published and compares its version; a stale CDN edge or a deploy
