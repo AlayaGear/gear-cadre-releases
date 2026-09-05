@@ -1251,24 +1251,45 @@ jobs:
           SITE_PROJECT: ${{ vars.CADRE_DOWNLOAD_SITE_PROJECT || 'gear-cadre' }}
         run: |
           set -euo pipefail
-          # Pinned: an unpinned `npx edgeone` is a floating dependency in the publish path of a
-          # release. Same reasoning as the SHA pins on every action above.
+          # **Installed with `npm install --prefix`, not `npx`, and pinned to a newer CLI.** Both
+          # halves of that are the fix for one failure, and neither is proven against this runner -
+          # see below.
           #
-          # Retried, because the failure that prompted this job's existence was `npm` resolving its
-          # own dependency tree rather than anything about this release - the kind of thing a second
-          # attempt fixes. A clean cache between attempts, because a half-written tree is what
-          # `edgesOut` on a null node means.
-          for attempt in 1 2 3; do
-            if npx --yes edgeone@1.6.21 makers deploy "$RUNNER_TEMP"/site \
-                 -n "$SITE_PROJECT" -t "$EDGEONE_API_TOKEN" -e production; then
+          # Runs #8 and #9 both died here with `npm error Cannot read properties of null (reading
+          # 'edgesOut')`, three times over in #9 with the cache cleared between attempts. That is
+          # npm's own dependency-graph builder failing, before a single byte is uploaded: the
+          # payload is ~32 KB of HTML and manifests, so nothing about this release reaches it.
+          #
+          # Two things change:
+          #
+          #   * `edgeone@1.6.21` was pinned in July and is 12 releases behind. `1.6.33` is current.
+          #   * `npx --yes` builds a throwaway tree in the npx cache to run one binary, which is the
+          #     code path that crashed. A plain install into a directory this job owns runs the same
+          #     binary without that step.
+          #
+          # **Neither is verified against the thing that broke.** `npx --yes edgeone@1.6.21` installs
+          # cleanly on a developer machine (Node 26, npm 11.13) - the crash is specific to this
+          # runner image, so it could not be reproduced where the fix was written. What *was* checked
+          # locally is that 1.6.33 installs, keeps this exact command surface, and deploys this
+          # site: a preview deployment of v0.2.9's page went out and returned `Deploy Success`. If
+          # this run fails the same way again, the version was not the cause and the next thing to
+          # try is EdgeOne's upload API directly, with no npm in the release path at all.
+          #
+          # The retry stays, at a lower count: it is worth having for a genuinely flaky network
+          # install, and it is no longer the thing being relied on.
+          eo="$RUNNER_TEMP/edgeone-cli"
+          for attempt in 1 2; do
+            if npm install --no-save --no-audit --no-fund --prefix "$eo" edgeone@1.6.33 \
+               && "$eo/node_modules/.bin/edgeone" makers deploy "$RUNNER_TEMP"/site \
+                    -n "$SITE_PROJECT" -t "$EDGEONE_API_TOKEN" -e production; then
               echo "- mirror:  ${SITE_BASE}" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
-            echo "attempt $attempt failed; clearing the npm cache and retrying" >&2
-            npm cache clean --force || true
+            echo "attempt $attempt failed; clearing the install and retrying" >&2
+            rm -rf "$eo"
             sleep 10
           done
-          echo "::error::the EdgeOne deploy failed three times" >&2
+          echo "::error::the EdgeOne deploy failed twice; see the note in this step about what to try next" >&2
           exit 1
 
       # Proves the mirror serves *this* build rather than that the upload returned 0. Reads the
