@@ -129,7 +129,7 @@ env:
   RELEASES_REPO: ${{ github.repository }}
   # The private repository this builds. Not a secret - the name is in the README - but the *access*
   # is: see SOURCE_READ_TOKEN above.
-  SOURCE_REPO: AlayaCapybara/gear-cadre
+  SOURCE_REPO: AlayaGear/gear-cadre
   # The **alias** tag, not the only one. Every publish writes two releases: `v<version>`, which is
   # kept forever, and this rolling one, which mirrors the newest. The alias exists because the feed
   # URL is compiled into clients that have already shipped and therefore has to stay constant while
