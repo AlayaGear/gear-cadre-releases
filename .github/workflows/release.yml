@@ -45,9 +45,11 @@ name: Release
 #
 # # What has to exist before this can run
 #
-# Four secrets, none of which this repository can generate for itself:
+# Five secrets, none of which this repository can generate for itself:
 #
 #   SOURCE_READ_TOKEN                   fine-grained PAT, Contents:Read on AlayaCapybara/gear-cadre
+#   PLUGINS_READ_TOKEN                  fine-grained PAT, Contents:Read on AlayaGear/gear-cadre-plugins
+#                                       (source refs from gear-cadre#1010 on hold plugins/ as a submodule)
 #   TAURI_SIGNING_PRIVATE_KEY           the minisign secret key, from `tauri signer generate`
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password - unset, because the key has none
 #   CADRE_UPDATE_PUBKEY                 the matching public key, baked into the client
@@ -592,6 +594,42 @@ jobs:
           ref: ${{ inputs.source-ref }}
           token: ${{ secrets.SOURCE_READ_TOKEN }}
           persist-credentials: false
+
+      # **`plugins/` is a submodule** of a second private repository, AlayaGear/gear-cadre-plugins,
+      # since gear-cadre#1010. The checkout above does not fetch it, and SOURCE_READ_TOKEN may not
+      # reach that repository, so it is fetched here with its own read-only token.
+      #
+      # Written out rather than `uses: ./.github/actions/checkout-plugins` from the source tree, and
+      # skipped when `.gitmodules` does not name `plugins`: a release can be built from a ref that
+      # predates the submodule, which has neither the action nor a submodule to fetch.
+      #
+      # The credential goes on the command line (`-c`), never into a config file, and is masked, for
+      # the reason `persist-credentials: false` gives above: these build logs are world-readable.
+      # `safe.directory` on the command line too, for the Linux leg's container, where the workspace
+      # is owned by another user; `sync`, `--force` and `clean` for a self-hosted runner whose
+      # workspace outlives the job.
+      - name: Fetch the plugins submodule
+        shell: bash
+        env:
+          PLUGINS_TOKEN: ${{ secrets.PLUGINS_READ_TOKEN }}
+        run: |
+          if ! grep -qE '^[[:space:]]*path[[:space:]]*=[[:space:]]*plugins[[:space:]]*$' .gitmodules 2>/dev/null; then
+            echo "this source ref has no plugins/ submodule; nothing to fetch"
+            exit 0
+          fi
+          if [ -z "$PLUGINS_TOKEN" ]; then
+            echo "::error::PLUGINS_READ_TOKEN is not set: plugins/ is a private submodule (AlayaGear/gear-cadre-plugins)."
+            exit 1
+          fi
+          auth=$(printf '%s' "x-access-token:${PLUGINS_TOKEN}" | base64 | tr -d '\r\n')
+          echo "::add-mask::${auth}"
+          git -c safe.directory='*' submodule sync -- plugins
+          git -c safe.directory='*' \
+              -c "http.https://github.com/.extraheader=" \
+              -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+              submodule update --init --force --depth 1 plugins
+          git -c safe.directory='*' -C plugins clean -ffdxq
+          echo "plugins/ at $(git -c safe.directory='*' -C plugins rev-parse --short HEAD)"
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
 
