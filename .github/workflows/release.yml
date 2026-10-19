@@ -1381,3 +1381,28 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  # Tells the unified release page (AlayaGear/gear-releases) that a new version is out, so it
+  # rebuilds now rather than on its next scheduled run. It holds no permission on this repository,
+  # and a failure here never fails the release: the page's schedule picks the version up anyway.
+  #
+  # GEAR_RELEASES_DISPATCH_TOKEN is a fine-grained token with Contents read and write on
+  # AlayaGear/gear-releases only, which is what `POST /dispatches` requires.
+  notify-release-page:
+    name: refresh the unified release page
+    needs: publish
+    if: ${{ needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Dispatch product-released to AlayaGear/gear-releases
+        env:
+          GH_TOKEN: ${{ secrets.GEAR_RELEASES_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::GEAR_RELEASES_DISPATCH_TOKEN is not set; the release page picks this version up on its schedule"
+            exit 0
+          fi
+          gh api repos/AlayaGear/gear-releases/dispatches -f event_type=product-released \
+            || echo "::warning::could not reach AlayaGear/gear-releases; the release page picks this version up on its schedule"
