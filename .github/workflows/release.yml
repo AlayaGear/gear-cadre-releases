@@ -236,6 +236,10 @@ jobs:
           grep -qF -- '--base-url "$base/v$VERSION"' "$wf" || fail "the archive manifest lost its own base URL"
           grep -qF -- '--base-url "$base/${RELEASE_TAG}"' "$wf" || fail "the alias manifest lost its own base URL"
 
+          # The notes come from the source's CHANGELOG.md entry, not a fixed line typed here.
+          grep -qF 'changelog-cli.mjs notes "$VERSION"' "$wf" || fail "the release notes no longer come from CHANGELOG.md"
+          grep -qF -- '--notes-file "$notes_file"' "$wf" || fail "publish_to no longer writes the changelog notes"
+
       - name: Every manifest is published as latest.json
         shell: bash
         run: |
@@ -287,7 +291,12 @@ jobs:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ inputs.source-ref }}
           token: ${{ secrets.SOURCE_READ_TOKEN }}
-          sparse-checkout: packages/client/src-tauri/tauri.conf.json
+          # The changelog and its checker too, for the entry check below.
+          sparse-checkout: |
+            packages/client/src-tauri/tauri.conf.json
+            packages/client/scripts/changelog.mjs
+            packages/client/scripts/changelog-cli.mjs
+            CHANGELOG.md
           sparse-checkout-cone-mode: false
       - id: pick
         shell: bash
@@ -372,6 +381,23 @@ jobs:
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "publishing as $version" >> "$GITHUB_STEP_SUMMARY"
+
+      # **No entry, no release.** The source's CHANGELOG.md entry for this version becomes the GitHub
+      # release notes, `latest.json`'s `notes`, the download site and the app's "What's new", so a
+      # missing or malformed one fails here, in seconds, with the heading to write - before ~20
+      # minutes of builds. A source ref older than the checker (gear-cadre #1449) has no entries to
+      # check and is let through with a warning, so an old tag can still be rebuilt.
+      - name: The changelog has an entry for this version
+        shell: bash
+        env:
+          VERSION: ${{ steps.pick.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -f packages/client/scripts/changelog-cli.mjs ]; then
+            node packages/client/scripts/changelog-cli.mjs check "$VERSION" --file CHANGELOG.md
+          else
+            echo "::warning::source predates the changelog check; publishing with the fixed notes"
+          fi
 
   build:
     needs: version
@@ -970,6 +996,7 @@ jobs:
           sparse-checkout: |
             packages/client/scripts
             deploy/download-site
+            CHANGELOG.md
           sparse-checkout-cone-mode: false
 
       # Proof the checkout above actually produced what the mirror needs, before ~20 minutes of
@@ -1038,13 +1065,26 @@ jobs:
           set -euo pipefail
           base="https://github.com/${RELEASES_REPO}/releases/download"
 
+          # The release notes, written once here and read by the manifests, `Publish` and the
+          # download pages: the source's CHANGELOG.md entry for this version (the `version` job has
+          # already refused a version without one). Empty for a source older than the changelog.
+          if [ -f packages/client/scripts/changelog-cli.mjs ]; then
+            node packages/client/scripts/changelog-cli.mjs notes "$VERSION" --file CHANGELOG.md \
+              > "$RUNNER_TEMP"/notes.md
+          else
+            : > "$RUNNER_TEMP"/notes.md
+          fi
+          notes=$(cat "$RUNNER_TEMP"/notes.md)
+
           mkdir -p "$RUNNER_TEMP"/versioned
           node packages/client/scripts/update-manifest.mjs \
-            --version "$VERSION" --base-url "$base/v$VERSION" --dir artifacts > /dev/null
+            --version "$VERSION" --base-url "$base/v$VERSION" --dir artifacts \
+            --notes "$notes" > /dev/null
           cp artifacts/latest.json "$RUNNER_TEMP"/versioned/latest.json
 
           node packages/client/scripts/update-manifest.mjs \
             --version "$VERSION" --base-url "$base/${RELEASE_TAG}" --dir artifacts \
+            --notes "$notes" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       # **Two releases per publish, and they are not redundant.**
@@ -1077,7 +1117,15 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.version.outputs.version }}"
-          notes="CADRE ${version}. Unsigned by Apple/Microsoft; see the source repository's docs/install.md."
+          # The changelog entry (`Compose the manifests` wrote it), then the unsigned-build notice as
+          # a footer. A file rather than `--notes`, because an entry runs to dozens of lines.
+          notes_file="$RUNNER_TEMP"/release-notes.md
+          notice="CADRE ${version}. Unsigned by Apple/Microsoft; see the source repository's docs/install.md."
+          if [ -s "$RUNNER_TEMP"/notes.md ]; then
+            { cat "$RUNNER_TEMP"/notes.md; printf '\n---\n\n%s\n' "$notice"; } > "$notes_file"
+          else
+            printf '%s\n' "$notice" > "$notes_file"
+          fi
 
           # `-print0` / `-0` throughout: `productName` has a space in it, and while the
           # normalisation step above has already removed those, a path list split on whitespace is
@@ -1099,9 +1147,9 @@ jobs:
           publish_to() {
             local tag="$1" title="$2" manifest="$3"
             if gh release view "$tag" --repo "$RELEASES_REPO" >/dev/null 2>&1; then
-              gh release edit "$tag" --repo "$RELEASES_REPO" --title "$title" --notes "$notes"
+              gh release edit "$tag" --repo "$RELEASES_REPO" --title "$title" --notes-file "$notes_file"
             else
-              gh release create "$tag" --repo "$RELEASES_REPO" --title "$title" --notes "$notes"
+              gh release create "$tag" --repo "$RELEASES_REPO" --title "$title" --notes-file "$notes_file"
             fi
             xargs -0 -a "$RUNNER_TEMP"/uploads.nul \
               gh release upload "$tag" --repo "$RELEASES_REPO" --clobber
@@ -1178,10 +1226,14 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.version.outputs.version }}"
+          # The current notes on the page and a full changelog.html, when the source has a changelog.
+          changelog=()
+          [ -f packages/client/scripts/changelog-cli.mjs ] && changelog=(--changelog CHANGELOG.md)
           node packages/client/scripts/build-download-site.mjs \
             --version "$version" \
             --dir artifacts \
             --out "$RUNNER_TEMP"/site \
+            ${changelog[@]+"${changelog[@]}"} \
             --template deploy/download-site \
             --feed "$RUNNER_TEMP"/versioned/latest.json \
             --site-base "$SITE_BASE" \
@@ -1204,10 +1256,13 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.version.outputs.version }}"
+          changelog=()
+          [ -f packages/client/scripts/changelog-cli.mjs ] && changelog=(--changelog CHANGELOG.md)
           node packages/client/scripts/build-download-site.mjs \
             --version "$version" \
             --dir artifacts \
             --out "$RUNNER_TEMP"/site-pages \
+            ${changelog[@]+"${changelog[@]}"} \
             --template deploy/download-site \
             --feed "$RUNNER_TEMP"/versioned/latest.json \
             --site-base "https://alayagear.github.io/gear-cadre-releases" \
